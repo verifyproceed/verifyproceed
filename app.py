@@ -11,6 +11,7 @@ import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, AnyHttpUrl, EmailStr
 
 APP_NAME = "Decision + Verification Agent"
@@ -54,6 +55,18 @@ _price_cache: Dict[str, Tuple[float, float]] = {}
 
 app = FastAPI(title=APP_NAME)
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://eglinlabs.com",
+        "https://www.eglinlabs.com",
+        "http://localhost:5173",
+        "http://localhost:3000",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ----------------------
 # Models
