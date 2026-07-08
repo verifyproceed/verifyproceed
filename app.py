@@ -4,7 +4,7 @@ import secrets
 import sqlite3
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Literal, Union, Annotated
+from typing import Any, Dict, List, Optional, Literal, Union, Annotated, Tuple
 
 import certifi
 import httpx
@@ -38,11 +38,19 @@ ISSUE_SIGNUP_KEYS = os.getenv("ISSUE_SIGNUP_KEYS", "true").lower() == "true"
 
 DB_PATH = Path(os.getenv("DB_PATH", str(BASE_DIR / "data" / "eglin.db")))
 
-# ── NEW: Supabase config for API key validation ────────────────────────────────
+# ── Supabase config for API key validation ────────────────────────────────────
 SUPABASE_URL = os.getenv("SUPABASE_URL", "https://dupfyqqbvkrmzjexwukd.supabase.co")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
 PAYMENT_WALLET = os.getenv("PAYMENT_WALLET", "0x9017DE667f3835b3A7cb2D50013F65fC3d408BbE")
-# ──────────────────────────────────────────────────────────────────────────────
+
+# ── CoinGecko config ──────────────────────────────────────────────────────────
+COINGECKO_API_KEY = os.getenv("COINGECKO_API_KEY", "")
+PRICE_CACHE_TTL_S = int(os.getenv("PRICE_CACHE_TTL_S", "60"))
+
+# ── In-memory price cache ─────────────────────────────────────────────────────
+# Stores (price, timestamp) per "asset_id:quote" key
+# Avoids repeated CoinGecko calls within the TTL window
+_price_cache: Dict[str, Tuple[float, float]] = {}
 
 app = FastAPI(title=APP_NAME)
 
@@ -335,23 +343,14 @@ def require_api_key(x_api_key: Optional[str]):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
-# ── NEW: Per-user key validator for ACP endpoints ─────────────────────────────
+# ── Per-user key validator for ACP endpoints ──────────────────────────────────
 async def validate_free_tier_key(request: Request) -> bool:
     """
     Check if the request carries a valid Eglin Labs free-tier API key.
-
-    Accepts:
-        Authorization: Bearer eglin_XXXX
-        X-Api-Key: eglin_XXXX
-
-    Checks two stores in order:
-        1. Supabase api_signups table  (keys issued via the website)
-        2. Local SQLite issued_api_keys (keys issued via /v1/api-keys/signup)
-
-    Returns True  → key is valid, skip payment requirement.
-    Returns False → no key / invalid key, caller must pay via x402.
+    Accepts:  Authorization: Bearer eglin_XXXX  or  X-Api-Key: eglin_XXXX
+    Checks Supabase first, then local SQLite as fallback.
+    Returns True if valid, False if not.
     """
-    # ── Extract the key from headers ─────────────────────────────────────────
     auth_header = request.headers.get("authorization", "")
     x_api_key_header = request.headers.get("x-api-key", "")
 
@@ -361,11 +360,10 @@ async def validate_free_tier_key(request: Request) -> bool:
     elif x_api_key_header:
         key = x_api_key_header.strip()
 
-    # No key at all — caller must use x402
     if not key or not key.startswith("eglin_"):
         return False
 
-    # ── 1. Check Supabase (keys from the website signup flow) ────────────────
+    # ── 1. Check Supabase ─────────────────────────────────────────────────────
     if SUPABASE_URL and SUPABASE_SERVICE_KEY:
         try:
             async with httpx.AsyncClient(verify=certifi.where()) as client:
@@ -389,7 +387,7 @@ async def validate_free_tier_key(request: Request) -> bool:
         except Exception as e:
             print(f"[key-validation] Supabase check failed: {e}")
 
-    # ── 2. Check local SQLite (keys from /v1/api-keys/signup on Render) ──────
+    # ── 2. Fallback: local SQLite ─────────────────────────────────────────────
     try:
         with db_conn() as conn:
             row = conn.execute(
@@ -401,12 +399,10 @@ async def validate_free_tier_key(request: Request) -> bool:
     except Exception as e:
         print(f"[key-validation] SQLite check failed: {e}")
 
-    # Key not found in either store
     return False
 
 
 def _payment_required_response() -> JSONResponse:
-    """Standard 402 response returned when no valid key is present."""
     return JSONResponse(
         status_code=402,
         content={
@@ -454,6 +450,82 @@ def _default_rpc_url_for_chain(chain: Optional[str]) -> Optional[str]:
         "polygon": "https://polygon-bor-rpc.publicnode.com",
     }
     return mapping.get((chain or "").lower())
+
+
+# ── Price fetching with cache + CoinGecko key + DeFiLlama fallback ────────────
+def _get_cached_price(asset_id: str, quote: str) -> Optional[float]:
+    """Return cached price if still within TTL, else None."""
+    cache_key = f"{asset_id}:{quote}"
+    cached = _price_cache.get(cache_key)
+    if cached and (time.time() - cached[1]) < PRICE_CACHE_TTL_S:
+        return cached[0]
+    return None
+
+
+def _set_cached_price(asset_id: str, quote: str, price: float) -> None:
+    _price_cache[f"{asset_id}:{quote}"] = (price, time.time())
+
+
+async def fetch_price(
+    client: httpx.AsyncClient,
+    asset_id: str,
+    quote: str,
+) -> Tuple[Optional[float], int]:
+    """
+    Fetch price with three layers:
+    1. In-memory cache (60s TTL) — zero network calls
+    2. CoinGecko with Demo API key (higher rate limit)
+    3. DeFiLlama fallback (free, no rate limits)
+    Returns (price, status_code)
+    """
+    # Layer 1 — cache
+    cached = _get_cached_price(asset_id, quote)
+    if cached is not None:
+        return cached, 200
+
+    # Layer 2 — CoinGecko
+    cg_headers = {}
+    if COINGECKO_API_KEY:
+        cg_headers["x-cg-demo-api-key"] = COINGECKO_API_KEY
+
+    try:
+        resp = await client.get(
+            "https://api.coingecko.com/api/v3/simple/price",
+            params={"ids": asset_id, "vs_currencies": quote},
+            headers=cg_headers,
+            timeout=DEFAULT_TIMEOUT_S,
+        )
+        if resp.status_code == 200:
+            price = resp.json().get(asset_id, {}).get(quote)
+            if price is not None:
+                _set_cached_price(asset_id, quote, price)
+                return price, 200
+        if resp.status_code != 429:
+            # Non-rate-limit error — don't bother with fallback
+            return None, resp.status_code
+    except Exception as e:
+        print(f"[coingecko] request failed: {e}")
+
+    # Layer 3 — DeFiLlama fallback
+    llama_id = f"coingecko:{asset_id}"
+    try:
+        resp = await client.get(
+            f"https://coins.llama.fi/prices/current/{llama_id}",
+            timeout=DEFAULT_TIMEOUT_S,
+        )
+        if resp.status_code == 200:
+            coins = resp.json().get("coins", {})
+            price_data = coins.get(llama_id, {})
+            price = price_data.get("price")
+            if price is not None:
+                price = float(price)
+                _set_cached_price(asset_id, quote, price)
+                return price, 200
+    except Exception as e:
+        print(f"[defillama] fallback failed: {e}")
+
+    return None, 429
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def build_guard_checks(payload: GuardRequest) -> List[CheckType]:
@@ -645,19 +717,10 @@ async def run_price_check(client: httpx.AsyncClient, check: VerifyPriceCheck) ->
     status_code = None
 
     try:
-        resp = await client.get(
-            "https://api.coingecko.com/api/v3/simple/price",
-            params={"ids": check.asset_id, "vs_currencies": check.quote},
-            timeout=DEFAULT_TIMEOUT_S,
-        )
-        status_code = resp.status_code
-        resp.raise_for_status()
-        payload = resp.json()
-
-        price = payload.get(check.asset_id, {}).get(check.quote)
+        price, status_code = await fetch_price(client, check.asset_id, check.quote)
 
         if price is None:
-            error = "Price not found in source response"
+            error = "Price not found in any source"
         else:
             meets_min = check.min_price is None or price >= check.min_price
             meets_max = check.max_price is None or price <= check.max_price
@@ -816,18 +879,10 @@ async def run_stablecoin_depeg_check(client: httpx.AsyncClient, check: VerifySta
     status_code = None
 
     try:
-        resp = await client.get(
-            "https://api.coingecko.com/api/v3/simple/price",
-            params={"ids": check.asset_id, "vs_currencies": check.quote},
-            timeout=DEFAULT_TIMEOUT_S,
-        )
-        status_code = resp.status_code
-        resp.raise_for_status()
-        payload = resp.json()
+        price, status_code = await fetch_price(client, check.asset_id, check.quote)
 
-        price = payload.get(check.asset_id, {}).get(check.quote)
         if price is None:
-            error = "Stablecoin price not found"
+            error = "Stablecoin price not found in any source"
         else:
             deviation_pct = abs(price - 1.0)
             ok = deviation_pct <= check.block_deviation_pct
@@ -1309,14 +1364,8 @@ async def capabilities():
         "name": APP_NAME,
         "description": "Verify external conditions before an AI agent executes actions.",
         "checks_supported": [
-            "http",
-            "rpc",
-            "price",
-            "tx",
-            "dex_price",
-            "stablecoin_depeg",
-            "bridge_exploit_monitor",
-            "rug_pull_risk",
+            "http", "rpc", "price", "tx", "dex_price",
+            "stablecoin_depeg", "bridge_exploit_monitor", "rug_pull_risk",
         ],
         "guard_actions_supported": ["swap", "transfer", "bridge", "yield_deposit", "generic"],
         "max_checks_private": MAX_CHECKS,
@@ -1386,19 +1435,26 @@ async def api_key_signup(payload: ApiKeySignupRequest):
     )
 
 
-# Core endpoints — private (require global API_KEY)
+# Private endpoints — require global API_KEY
 @app.post("/v1/decide", response_model=DecideResponse)
 async def decide(req: DecideRequest, x_api_key: Optional[str] = Header(default=None)):
     require_api_key(x_api_key)
     return await process_decision(req, MAX_CHECKS)
 
 
-# ── UPDATED: ACP decide now validates per-user API keys ───────────────────────
+# ── ACP endpoints — validate per-user API keys ────────────────────────────────
 @app.post("/v1/acp/decide", response_model=DecideResponse)
 async def acp_decide(req: DecideRequest, request: Request):
     if not await validate_free_tier_key(request):
         return _payment_required_response()
     return await process_decision(req, ACP_MAX_CHECKS)
+
+
+@app.post("/v1/acp/guard", response_model=DecideResponse)
+async def acp_universal_guard(payload: GuardRequest, request: Request):
+    if not await validate_free_tier_key(request):
+        return _payment_required_response()
+    return await run_guard_payload(payload, ACP_MAX_CHECKS)
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -1406,15 +1462,6 @@ async def acp_decide(req: DecideRequest, request: Request):
 async def universal_guard(payload: GuardRequest, x_api_key: Optional[str] = Header(default=None)):
     require_api_key(x_api_key)
     return await run_guard_payload(payload, MAX_CHECKS)
-
-
-# ── UPDATED: ACP guard now validates per-user API keys ────────────────────────
-@app.post("/v1/acp/guard", response_model=DecideResponse)
-async def acp_universal_guard(payload: GuardRequest, request: Request):
-    if not await validate_free_tier_key(request):
-        return _payment_required_response()
-    return await run_guard_payload(payload, ACP_MAX_CHECKS)
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 # Website-listed product aliases
