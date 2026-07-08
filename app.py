@@ -9,7 +9,8 @@ from typing import Any, Dict, List, Optional, Literal, Union, Annotated
 import certifi
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, AnyHttpUrl, EmailStr
 
 APP_NAME = "Decision + Verification Agent"
@@ -36,6 +37,12 @@ MAX_LLM_TOKENS = int(os.getenv("MAX_LLM_TOKENS", "260"))
 ISSUE_SIGNUP_KEYS = os.getenv("ISSUE_SIGNUP_KEYS", "true").lower() == "true"
 
 DB_PATH = Path(os.getenv("DB_PATH", str(BASE_DIR / "data" / "eglin.db")))
+
+# ── NEW: Supabase config for API key validation ────────────────────────────────
+SUPABASE_URL = os.getenv("SUPABASE_URL", "https://dupfyqqbvkrmzjexwukd.supabase.co")
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
+PAYMENT_WALLET = os.getenv("PAYMENT_WALLET", "0x9017DE667f3835b3A7cb2D50013F65fC3d408BbE")
+# ──────────────────────────────────────────────────────────────────────────────
 
 app = FastAPI(title=APP_NAME)
 
@@ -326,6 +333,95 @@ def require_api_key(x_api_key: Optional[str]):
         return
     if not x_api_key or x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+# ── NEW: Per-user key validator for ACP endpoints ─────────────────────────────
+async def validate_free_tier_key(request: Request) -> bool:
+    """
+    Check if the request carries a valid Eglin Labs free-tier API key.
+
+    Accepts:
+        Authorization: Bearer eglin_XXXX
+        X-Api-Key: eglin_XXXX
+
+    Checks two stores in order:
+        1. Supabase api_signups table  (keys issued via the website)
+        2. Local SQLite issued_api_keys (keys issued via /v1/api-keys/signup)
+
+    Returns True  → key is valid, skip payment requirement.
+    Returns False → no key / invalid key, caller must pay via x402.
+    """
+    # ── Extract the key from headers ─────────────────────────────────────────
+    auth_header = request.headers.get("authorization", "")
+    x_api_key_header = request.headers.get("x-api-key", "")
+
+    key = ""
+    if auth_header.lower().startswith("bearer "):
+        key = auth_header[7:].strip()
+    elif x_api_key_header:
+        key = x_api_key_header.strip()
+
+    # No key at all — caller must use x402
+    if not key or not key.startswith("eglin_"):
+        return False
+
+    # ── 1. Check Supabase (keys from the website signup flow) ────────────────
+    if SUPABASE_URL and SUPABASE_SERVICE_KEY:
+        try:
+            async with httpx.AsyncClient(verify=certifi.where()) as client:
+                resp = await client.get(
+                    f"{SUPABASE_URL}/rest/v1/api_signups",
+                    params={
+                        "api_key": f"eq.{key}",
+                        "status": "eq.active",
+                        "select": "id,plan",
+                    },
+                    headers={
+                        "apikey": SUPABASE_SERVICE_KEY,
+                        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+                    },
+                    timeout=5.0,
+                )
+                if resp.status_code == 200:
+                    rows = resp.json()
+                    if isinstance(rows, list) and len(rows) > 0:
+                        return True
+        except Exception as e:
+            print(f"[key-validation] Supabase check failed: {e}")
+
+    # ── 2. Check local SQLite (keys from /v1/api-keys/signup on Render) ──────
+    try:
+        with db_conn() as conn:
+            row = conn.execute(
+                "SELECT id FROM issued_api_keys WHERE api_key = ? AND is_active = 1",
+                (key,),
+            ).fetchone()
+            if row:
+                return True
+    except Exception as e:
+        print(f"[key-validation] SQLite check failed: {e}")
+
+    # Key not found in either store
+    return False
+
+
+def _payment_required_response() -> JSONResponse:
+    """Standard 402 response returned when no valid key is present."""
+    return JSONResponse(
+        status_code=402,
+        content={
+            "status": "payment_required",
+            "code": 402,
+            "price": "0.01",
+            "currency": "USDC",
+            "network": "base",
+            "pay_to": PAYMENT_WALLET,
+            "note": "Pay $0.01 USDC on Base via x402 and retry, or use a free API key.",
+            "get_key": "https://eglinlabs.com/get-api-key",
+            "docs": "https://eglinlabs.com/docs",
+        },
+    )
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 # ----------------------
@@ -1290,16 +1386,20 @@ async def api_key_signup(payload: ApiKeySignupRequest):
     )
 
 
-# Core endpoints
+# Core endpoints — private (require global API_KEY)
 @app.post("/v1/decide", response_model=DecideResponse)
 async def decide(req: DecideRequest, x_api_key: Optional[str] = Header(default=None)):
     require_api_key(x_api_key)
     return await process_decision(req, MAX_CHECKS)
 
 
+# ── UPDATED: ACP decide now validates per-user API keys ───────────────────────
 @app.post("/v1/acp/decide", response_model=DecideResponse)
-async def acp_decide(req: DecideRequest):
+async def acp_decide(req: DecideRequest, request: Request):
+    if not await validate_free_tier_key(request):
+        return _payment_required_response()
     return await process_decision(req, ACP_MAX_CHECKS)
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 @app.post("/v1/guard", response_model=DecideResponse)
@@ -1308,9 +1408,13 @@ async def universal_guard(payload: GuardRequest, x_api_key: Optional[str] = Head
     return await run_guard_payload(payload, MAX_CHECKS)
 
 
+# ── UPDATED: ACP guard now validates per-user API keys ────────────────────────
 @app.post("/v1/acp/guard", response_model=DecideResponse)
-async def acp_universal_guard(payload: GuardRequest):
+async def acp_universal_guard(payload: GuardRequest, request: Request):
+    if not await validate_free_tier_key(request):
+        return _payment_required_response()
     return await run_guard_payload(payload, ACP_MAX_CHECKS)
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 # Website-listed product aliases
