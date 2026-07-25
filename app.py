@@ -61,7 +61,7 @@ app.add_middleware(
         "https://eglinlabs.com",
         "https://www.eglinlabs.com",
         "https://verifyproceed.com",
-+        "https://www.verifyproceed.com",
+        "https://www.verifyproceed.com",
         "http://localhost:5173",
         "http://localhost:3000",
     ],
