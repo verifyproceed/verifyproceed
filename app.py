@@ -14,7 +14,7 @@ from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, AnyHttpUrl, EmailStr
 
-APP_NAME = "Decision + Verification Agent"
+APP_NAME = "VerifyProceed API"
 
 # ----------------------
 # Env / config
@@ -28,7 +28,7 @@ OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini")
 OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
 
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://decision-verification-agent.onrender.com")
-DOCS_URL = os.getenv("DOCS_URL", "https://eglin-labs-decision-twu5.bolt.host/docs")
+DOCS_URL = os.getenv("DOCS_URL", "https://verifyproceed.com/docs")
 
 DEFAULT_TIMEOUT_S = float(os.getenv("HTTP_TIMEOUT_S", "12"))
 MAX_CHECKS = int(os.getenv("MAX_CHECKS", "10"))
@@ -60,6 +60,8 @@ app.add_middleware(
     allow_origins=[
         "https://eglinlabs.com",
         "https://www.eglinlabs.com",
+        "https://verifyproceed.com",
++        "https://www.verifyproceed.com",
         "http://localhost:5173",
         "http://localhost:3000",
     ],
@@ -359,7 +361,7 @@ def require_api_key(x_api_key: Optional[str]):
 # ── Per-user key validator for ACP endpoints ──────────────────────────────────
 async def validate_free_tier_key(request: Request) -> bool:
     """
-    Check if the request carries a valid Eglin Labs free-tier API key.
+    Check if the request carries a valid VerifyProceed free-tier API key.
     Accepts:  Authorization: Bearer eglin_XXXX  or  X-Api-Key: eglin_XXXX
     Checks Supabase first, then local SQLite as fallback.
     Returns True if valid, False if not.
@@ -426,8 +428,8 @@ def _payment_required_response() -> JSONResponse:
             "network": "base",
             "pay_to": PAYMENT_WALLET,
             "note": "Pay $0.01 USDC on Base via x402 and retry, or use a free API key.",
-            "get_key": "https://eglinlabs.com/get-api-key",
-            "docs": "https://eglinlabs.com/docs",
+            "get_key": "https://verifyproceed.com/get-api-key",
++            "docs": "https://verifyproceed.com/docs",
         },
     )
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1440,7 +1442,7 @@ async def api_key_signup(payload: ApiKeySignupRequest):
         message=(
             "Signup received. Use the issued key for private endpoints."
             if issued_key
-            else "Signup received. Eglin Labs will follow up with access."
+            else "Signup received. VerifyProceed will follow up with access."
         ),
         api_key=issued_key,
         docs_url=DOCS_URL,
