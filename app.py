@@ -429,7 +429,7 @@ def _payment_required_response() -> JSONResponse:
             "pay_to": PAYMENT_WALLET,
             "note": "Pay $0.01 USDC on Base via x402 and retry, or use a free API key.",
             "get_key": "https://verifyproceed.com/get-api-key",
-+            "docs": "https://verifyproceed.com/docs",
+            "docs": "https://verifyproceed.com/docs",
         },
     )
 # ─────────────────────────────────────────────────────────────────────────────
