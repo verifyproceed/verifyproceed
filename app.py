@@ -362,7 +362,7 @@ def require_api_key(x_api_key: Optional[str]):
 async def validate_free_tier_key(request: Request) -> bool:
     """
     Check if the request carries a valid VerifyProceed free-tier API key.
-    Accepts:  Authorization: Bearer eglin_XXXX  or  X-Api-Key: eglin_XXXX
+    Accepts:  Authorization: Bearer vp_XXXX (or legacy eglin_XXXX)  or  X-Api-Key: vp_XXXX (or legacy eglin_XXXX)
     Checks Supabase first, then local SQLite as fallback.
     Returns True if valid, False if not.
     """
@@ -375,7 +375,7 @@ async def validate_free_tier_key(request: Request) -> bool:
     elif x_api_key_header:
         key = x_api_key_header.strip()
 
-    if not key or not key.startswith("eglin_"):
+    if not key or not (key.startswith("vp_") or key.startswith("eglin_")):
         return False
 
     # ── 1. Check Supabase ─────────────────────────────────────────────────────
@@ -1408,7 +1408,7 @@ async def list_agents():
 async def api_key_signup(payload: ApiKeySignupRequest):
     issued_key = None
     if ISSUE_SIGNUP_KEYS:
-        issued_key = f"eglin_{secrets.token_urlsafe(24)}"
+        issued_key = f"vp_{secrets.token_urlsafe(24)}"
 
     with db_conn() as conn:
         conn.execute(
