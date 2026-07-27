@@ -13,6 +13,12 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, AnyHttpUrl, EmailStr
+from x402.http import FacilitatorConfig, HTTPFacilitatorClient
+from x402.http.middleware.fastapi import PaymentMiddlewareASGI
+from x402.http.types import RouteConfig
+from x402.mechanisms.evm.exact import ExactEvmServerScheme
+from x402.server import x402ResourceServer
+from x402.extensions.bazaar import declare_discovery_extension, OutputConfig
 
 APP_NAME = "VerifyProceed API"
 
@@ -43,6 +49,8 @@ DB_PATH = Path(os.getenv("DB_PATH", str(BASE_DIR / "data" / "eglin.db")))
 SUPABASE_URL = os.getenv("SUPABASE_URL", "https://dupfyqqbvkrmzjexwukd.supabase.co")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
 PAYMENT_WALLET = os.getenv("PAYMENT_WALLET", "0x9017DE667f3835b3A7cb2D50013F65fC3d408BbE")
+X402_NETWORK = os.getenv("X402_NETWORK", "base-sepolia")  # "base-sepolia" = practice mode, "base" = real money
+CDP_FACILITATOR_URL = os.getenv("CDP_FACILITATOR_URL", "https://api.cdp.coinbase.com/platform/v2/x402")
 
 # ── CoinGecko config ──────────────────────────────────────────────────────────
 COINGECKO_API_KEY = os.getenv("COINGECKO_API_KEY", "")
@@ -54,7 +62,37 @@ PRICE_CACHE_TTL_S = int(os.getenv("PRICE_CACHE_TTL_S", "60"))
 _price_cache: Dict[str, Tuple[float, float]] = {}
 
 app = FastAPI(title=APP_NAME)
+_facilitator = HTTPFacilitatorClient(FacilitatorConfig(url=CDP_FACILITATOR_URL))
 
+_x402_routes = {
+    "POST /v1/acp/guard": RouteConfig(
+        accepts={"payTo": PAYMENT_WALLET, "scheme": ExactEvmServerScheme, "network": X402_NETWORK, "price": "$0.01"},
+        extensions=[
+            declare_discovery_extension(
+                output=OutputConfig(
+                    example={"verdict": "proceed", "confidence": 0.94, "risk": "low"},
+                    schema={"properties": {"verdict": {"type": "string"}, "confidence": {"type": "number"}, "risk": {"type": "string"}}},
+                ),
+                description="Pre-execution safety verification for on-chain agent actions. Returns a proceed, wait, or block verdict with a confidence score and per-check breakdown, before your agent executes.",
+            )
+        ],
+    ),
+    "POST /v1/acp/decide": RouteConfig(
+        accepts={"payTo": PAYMENT_WALLET, "scheme": ExactEvmServerScheme, "network": X402_NETWORK, "price": "$0.01"},
+        extensions=[
+            declare_discovery_extension(
+                output=OutputConfig(
+                    example={"verdict": "proceed", "confidence": 0.94, "risk": "low"},
+                    schema={"properties": {"verdict": {"type": "string"}, "confidence": {"type": "number"}}},
+                ),
+                description="Policy-driven pre-execution decision for autonomous agents, based on custom verification checks.",
+            )
+        ],
+    ),
+}
+
+_resource_server = x402ResourceServer(facilitator=_facilitator, routes=_x402_routes)
+app.add_middleware(PaymentMiddlewareASGI, resource_server=_resource_server)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
