@@ -14,6 +14,8 @@ from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, AnyHttpUrl, EmailStr
 from x402.http import FacilitatorConfig, HTTPFacilitatorClient, PaymentOption
+from x402.http.facilitator_client_base import AuthHeaders
+from cdp.auth.utils.jwt import generate_jwt, JwtOptions
 from x402.http.middleware.fastapi import PaymentMiddlewareASGI
 from x402.http.types import RouteConfig
 from x402.mechanisms.evm.exact import ExactEvmServerScheme
@@ -62,7 +64,26 @@ PRICE_CACHE_TTL_S = int(os.getenv("PRICE_CACHE_TTL_S", "60"))
 _price_cache: Dict[str, Tuple[float, float]] = {}
 
 app = FastAPI(title=APP_NAME)
-_facilitator = HTTPFacilitatorClient(FacilitatorConfig(url=CDP_FACILITATOR_URL))
+class CDPAuthProvider:
+    def _jwt_for(self, method: str, path: str) -> str:
+        return generate_jwt(JwtOptions(
+            api_key_id=os.getenv("CDP_API_KEY_ID", ""),
+            api_key_secret=os.getenv("CDP_API_KEY_SECRET", ""),
+            request_method=method,
+            request_host="api.cdp.coinbase.com",
+            request_path=path,
+            expires_in=120,
+        ))
+
+    def get_auth_headers(self) -> AuthHeaders:
+        return AuthHeaders(
+            verify={"Authorization": f"Bearer {self._jwt_for('POST', '/platform/v2/x402/verify')}"},
+            settle={"Authorization": f"Bearer {self._jwt_for('POST', '/platform/v2/x402/settle')}"},
+            supported={"Authorization": f"Bearer {self._jwt_for('GET', '/platform/v2/x402/supported')}"},
+        )
+
+
+_facilitator = HTTPFacilitatorClient(FacilitatorConfig(url=CDP_FACILITATOR_URL, auth_provider=CDPAuthProvider()))
 _resource_server = x402ResourceServer(_facilitator)
 _resource_server.register(X402_NETWORK, ExactEvmServerScheme())
 
