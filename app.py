@@ -13,7 +13,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, AnyHttpUrl, EmailStr
-from x402.http import FacilitatorConfig, HTTPFacilitatorClient
+from x402.http import FacilitatorConfig, HTTPFacilitatorClient, PaymentOption
 from x402.http.middleware.fastapi import PaymentMiddlewareASGI
 from x402.http.types import RouteConfig
 from x402.mechanisms.evm.exact import ExactEvmServerScheme
@@ -49,7 +49,7 @@ DB_PATH = Path(os.getenv("DB_PATH", str(BASE_DIR / "data" / "eglin.db")))
 SUPABASE_URL = os.getenv("SUPABASE_URL", "https://dupfyqqbvkrmzjexwukd.supabase.co")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
 PAYMENT_WALLET = os.getenv("PAYMENT_WALLET", "0x9017DE667f3835b3A7cb2D50013F65fC3d408BbE")
-X402_NETWORK = os.getenv("X402_NETWORK", "base-sepolia")  # "base-sepolia" = practice mode, "base" = real money
+X402_NETWORK = os.getenv("X402_NETWORK", "eip155:84532")  # "eip155:84532" = Base Sepolia practice mode, "eip155:8453" = Base mainnet real money
 CDP_FACILITATOR_URL = os.getenv("CDP_FACILITATOR_URL", "https://api.cdp.coinbase.com/platform/v2/x402")
 
 # ── CoinGecko config ──────────────────────────────────────────────────────────
@@ -63,36 +63,61 @@ _price_cache: Dict[str, Tuple[float, float]] = {}
 
 app = FastAPI(title=APP_NAME)
 _facilitator = HTTPFacilitatorClient(FacilitatorConfig(url=CDP_FACILITATOR_URL))
+_resource_server = x402ResourceServer(_facilitator)
+_resource_server.register(X402_NETWORK, ExactEvmServerScheme())
 
 _x402_routes = {
-    "POST /v1/acp/guard": RouteConfig(
-        accepts={"payTo": PAYMENT_WALLET, "scheme": ExactEvmServerScheme, "network": X402_NETWORK, "price": "$0.01"},
-        extensions=[
-            declare_discovery_extension(
-                output=OutputConfig(
-                    example={"verdict": "proceed", "confidence": 0.94, "risk": "low"},
-                    schema={"properties": {"verdict": {"type": "string"}, "confidence": {"type": "number"}, "risk": {"type": "string"}}},
-                ),
-                description="Pre-execution safety verification for on-chain agent actions. Returns a proceed, wait, or block verdict with a confidence score and per-check breakdown, before your agent executes.",
-            )
-        ],
+    "POST /v1/x402/guard": RouteConfig(
+        accepts=[PaymentOption(scheme="exact", pay_to=PAYMENT_WALLET, price="$0.01", network=X402_NETWORK)],
+        mime_type="application/json",
+        description="Pre-execution safety verification for on-chain agent actions. Returns a proceed, wait, or block verdict with a confidence score and per-check breakdown, before your agent executes.",
+        extensions=declare_discovery_extension(
+            body_type="json",
+            input={"action": "swap", "chain": "base"},
+            input_schema={
+                "properties": {
+                    "action": {"type": "string"},
+                    "chain": {"type": "string"},
+                },
+                "required": ["action"],
+            },
+            output=OutputConfig(
+                example={"verdict": "proceed", "confidence": 0.94, "risk": "low"},
+                schema={
+                    "properties": {
+                        "verdict": {"type": "string"},
+                        "confidence": {"type": "number"},
+                        "risk": {"type": "string"},
+                    }
+                },
+            ),
+        ),
     ),
-    "POST /v1/acp/decide": RouteConfig(
-        accepts={"payTo": PAYMENT_WALLET, "scheme": ExactEvmServerScheme, "network": X402_NETWORK, "price": "$0.01"},
-        extensions=[
-            declare_discovery_extension(
-                output=OutputConfig(
-                    example={"verdict": "proceed", "confidence": 0.94, "risk": "low"},
-                    schema={"properties": {"verdict": {"type": "string"}, "confidence": {"type": "number"}}},
-                ),
-                description="Policy-driven pre-execution decision for autonomous agents, based on custom verification checks.",
-            )
-        ],
+    "POST /v1/x402/decide": RouteConfig(
+        accepts=[PaymentOption(scheme="exact", pay_to=PAYMENT_WALLET, price="$0.01", network=X402_NETWORK)],
+        mime_type="application/json",
+        description="Policy-driven pre-execution decision for autonomous agents, based on custom verification checks.",
+        extensions=declare_discovery_extension(
+            body_type="json",
+            input={"goal": "Verify a bridge transfer is safe before executing"},
+            input_schema={
+                "properties": {"goal": {"type": "string"}},
+                "required": ["goal"],
+            },
+            output=OutputConfig(
+                example={"verdict": "proceed", "confidence": 0.94, "risk": "low"},
+                schema={
+                    "properties": {
+                        "verdict": {"type": "string"},
+                        "confidence": {"type": "number"},
+                    }
+                },
+            ),
+        ),
     ),
 }
 
-_resource_server = x402ResourceServer(facilitator=_facilitator, routes=_x402_routes)
-app.add_middleware(PaymentMiddlewareASGI, resource_server=_resource_server)
+app.add_middleware(PaymentMiddlewareASGI, routes=_x402_routes, server=_resource_server)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -1510,6 +1535,14 @@ async def acp_universal_guard(payload: GuardRequest, request: Request):
     return await run_guard_payload(payload, ACP_MAX_CHECKS)
 # ─────────────────────────────────────────────────────────────────────────────
 
+@app.post("/v1/x402/guard", response_model=DecideResponse)
+async def x402_guard(payload: GuardRequest, request: Request):
+    return await run_guard_payload(payload, ACP_MAX_CHECKS)
+
+
+@app.post("/v1/x402/decide", response_model=DecideResponse)
+async def x402_decide(req: DecideRequest, request: Request):
+    return await process_decision(req, ACP_MAX_CHECKS)
 
 @app.post("/v1/guard", response_model=DecideResponse)
 async def universal_guard(payload: GuardRequest, x_api_key: Optional[str] = Header(default=None)):
