@@ -92,6 +92,7 @@ _resource_server.register(X402_NETWORK, ExactEvmServerScheme())
 
 _x402_routes = {
     "POST /v1/x402/guard": RouteConfig(
+        resource="https://api.verifyproceed.com/v1/x402/guard",
         accepts=[PaymentOption(scheme="exact", pay_to=PAYMENT_WALLET, price="$0.01", network=X402_NETWORK)],
         mime_type="application/json",
         description="Pre-execution safety verification for on-chain agent actions. Returns a proceed, wait, or block verdict with a confidence score and per-check breakdown, before your agent executes.",
@@ -118,6 +119,7 @@ _x402_routes = {
         ),
     ),
     "POST /v1/x402/decide": RouteConfig(
+        resource="https://api.verifyproceed.com/v1/x402/decide",
         accepts=[PaymentOption(scheme="exact", pay_to=PAYMENT_WALLET, price="$0.01", network=X402_NETWORK)],
         mime_type="application/json",
         description="Policy-driven pre-execution decision for autonomous agents, based on custom verification checks.",
