@@ -1,4 +1,7 @@
 import json
+import logging
+
+logging.basicConfig(level=logging.INFO)
 import os
 import secrets
 import sqlite3
