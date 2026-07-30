@@ -235,6 +235,17 @@ class VerifyRugPullRiskCheck(BaseModel):
     min_buys_h24: Optional[int] = None
     min_sells_h24: Optional[int] = None
 
+class VerifyApprovalCheck(BaseModel):
+    type: Literal["approval_amount"] = "approval_amount"
+    amount: str
+    spender: Optional[str] = None
+    known_safe_addresses: List[str] = Field(default_factory=list)
+
+
+class VerifyContractVerifiedCheck(BaseModel):
+    type: Literal["contract_verified"] = "contract_verified"
+    chain: str
+    contract_address: str
 
 CheckType = Annotated[
     Union[
@@ -246,6 +257,8 @@ CheckType = Annotated[
         VerifyStablecoinDepegCheck,
         VerifyBridgeExploitMonitorCheck,
         VerifyRugPullRiskCheck,
+        VerifyApprovalCheck,
+        VerifyContractVerifiedCheck,
     ],
     Field(discriminator="type"),
 ]
@@ -270,7 +283,10 @@ class DecideResponse(BaseModel):
 
 
 class GuardRequest(BaseModel):
-    action: Literal["swap", "transfer", "bridge", "yield_deposit", "generic"]
+    action: Literal[
+        "swap", "transfer", "bridge", "yield_deposit", "generic",
+        "approve", "mint", "stake", "add_liquidity", "contract_call",
+    ]
     chain: Optional[str] = "base"
     pair_address: Optional[str] = None
     stablecoin_asset_id: Optional[str] = "usd-coin"
@@ -280,6 +296,11 @@ class GuardRequest(BaseModel):
     amount_usd: Optional[float] = None
     strict_mode: bool = True
     context: Dict[str, Any] = Field(default_factory=dict)
+    # New fields, used by approve / mint / stake / add_liquidity / contract_call
+    spender: Optional[str] = None
+    approval_amount: Optional[str] = None
+    contract_address: Optional[str] = None
+    known_safe_addresses: List[str] = Field(default_factory=list)
 
 
 class AgentInfo(BaseModel):
@@ -688,7 +709,6 @@ def build_guard_checks(payload: GuardRequest) -> List[CheckType]:
                 expect_status=200,
             )
         )
-
     if payload.action == "transfer" and payload.tx_hash and rpc_url:
         checks.append(
             VerifyTxCheck(
@@ -698,7 +718,50 @@ def build_guard_checks(payload: GuardRequest) -> List[CheckType]:
                 require_success=True,
             )
         )
-
+    if payload.action == "approve" and payload.approval_amount is not None:
+        checks.append(
+            VerifyApprovalCheck(
+                type="approval_amount",
+                amount=payload.approval_amount,
+                spender=payload.spender,
+                known_safe_addresses=payload.known_safe_addresses,
+            )
+        )
+    if payload.action in ("mint", "stake", "contract_call") and payload.contract_address and payload.chain:
+        checks.append(
+            VerifyContractVerifiedCheck(
+                type="contract_verified",
+                chain=payload.chain,
+                contract_address=payload.contract_address,
+            )
+        )
+    if payload.action == "add_liquidity" and payload.pair_address and payload.chain:
+        checks.append(
+            VerifyDexPriceCheck(
+                type="dex_price",
+                chain=payload.chain,
+                pair_address=payload.pair_address,
+                min_liquidity_usd=50000,
+            )
+        )
+        checks.append(
+            VerifyRugPullRiskCheck(
+                type="rug_pull_risk",
+                chain=payload.chain,
+                pair_address=payload.pair_address,
+                min_liquidity_usd=50000,
+                min_pair_age_minutes=1440,
+                max_fdv_to_liquidity_ratio=20.0,
+            )
+        )
+        if payload.contract_address:
+            checks.append(
+                VerifyContractVerifiedCheck(
+                    type="contract_verified",
+                    chain=payload.chain,
+                    contract_address=payload.contract_address,
+                )
+            )
     return checks
 
 
@@ -1155,6 +1218,97 @@ async def run_rug_pull_risk_check(client: httpx.AsyncClient, check: VerifyRugPul
         "pair_url": pair.get("url") if pair else None,
     }
 
+async def run_approval_check(check: VerifyApprovalCheck) -> Dict[str, Any]:
+    t0 = time.time()
+    error = None
+    is_unlimited = False
+    UINT256_MAX = 2**256 - 1
+    try:
+        amount_int = int(check.amount)
+        # Treat both the literal max value and any absurdly large number as "unlimited"
+        is_unlimited = amount_int >= UINT256_MAX // 2
+    except (TypeError, ValueError):
+        error = "Could not parse approval amount as an integer"
+
+    spender_lower = (check.spender or "").lower()
+    known_safe_lower = [a.lower() for a in check.known_safe_addresses]
+    spender_is_known_safe = bool(spender_lower) and spender_lower in known_safe_lower
+
+    ok = (not is_unlimited) or spender_is_known_safe
+    latency_ms = int((time.time() - t0) * 1000)
+    return {
+        "type": "approval_amount",
+        "amount": check.amount,
+        "spender": check.spender,
+        "is_unlimited": is_unlimited,
+        "spender_is_known_safe": spender_is_known_safe,
+        "latency_ms": latency_ms,
+        "ok": ok,
+        "transient": False,
+        "error": error,
+    }
+
+_EXPLORER_API_BASE = {
+    "base": "https://api.basescan.org/api",
+}
+
+async def run_contract_verified_check(client: httpx.AsyncClient, check: VerifyContractVerifiedCheck) -> Dict[str, Any]:
+    t0 = time.time()
+    ok = False
+    error = None
+    verified = None
+    status_code = None
+
+    explorer_base = _EXPLORER_API_BASE.get((check.chain or "").lower())
+    basescan_key = os.getenv("BASESCAN_API_KEY", "")
+
+    if not explorer_base or not basescan_key:
+        latency_ms = int((time.time() - t0) * 1000)
+        return {
+            "type": "contract_verified",
+            "chain": check.chain,
+            "contract_address": check.contract_address,
+            "latency_ms": latency_ms,
+            "ok": False,
+            "transient": False,
+            "error": "Contract verification not configured for this chain (missing BASESCAN_API_KEY or unsupported chain)",
+            "verified": None,
+        }
+
+    try:
+        resp = await client.get(
+            explorer_base,
+            params={
+                "module": "contract",
+                "action": "getsourcecode",
+                "address": check.contract_address,
+                "apikey": basescan_key,
+            },
+            timeout=DEFAULT_TIMEOUT_S,
+        )
+        status_code = resp.status_code
+        resp.raise_for_status()
+        payload = resp.json()
+        result = (payload.get("result") or [{}])[0]
+        source_code = result.get("SourceCode", "")
+        verified = bool(source_code)
+        ok = verified
+    except Exception as e:
+        error = str(e)
+
+    latency_ms = int((time.time() - t0) * 1000)
+    transient = bool(error)
+    return {
+        "type": "contract_verified",
+        "chain": check.chain,
+        "contract_address": check.contract_address,
+        "status": status_code,
+        "latency_ms": latency_ms,
+        "ok": ok,
+        "transient": transient,
+        "error": error,
+        "verified": verified,
+    }
 
 async def run_check(client: httpx.AsyncClient, check: CheckType) -> Dict[str, Any]:
     if isinstance(check, VerifyHTTPCheck):
@@ -1173,7 +1327,10 @@ async def run_check(client: httpx.AsyncClient, check: CheckType) -> Dict[str, An
         return await run_bridge_exploit_monitor_check(client, check)
     if isinstance(check, VerifyRugPullRiskCheck):
         return await run_rug_pull_risk_check(client, check)
-
+    if isinstance(check, VerifyApprovalCheck):
+        return await run_approval_check(check)
+    if isinstance(check, VerifyContractVerifiedCheck):
+        return await run_contract_verified_check(client, check)
     return {
         "type": "unknown",
         "ok": False,
@@ -1470,8 +1627,12 @@ async def capabilities():
         "checks_supported": [
             "http", "rpc", "price", "tx", "dex_price",
             "stablecoin_depeg", "bridge_exploit_monitor", "rug_pull_risk",
+            "approval_amount", "contract_verified",
         ],
-        "guard_actions_supported": ["swap", "transfer", "bridge", "yield_deposit", "generic"],
+        "guard_actions_supported": [
+            "swap", "transfer", "bridge", "yield_deposit", "generic",
+            "approve", "mint", "stake", "add_liquidity", "contract_call",
+        ],
         "max_checks_private": MAX_CHECKS,
         "max_checks_acp": ACP_MAX_CHECKS,
         "decision_types": ["proceed", "wait", "block"],
