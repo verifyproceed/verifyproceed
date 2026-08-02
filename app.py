@@ -1248,21 +1248,28 @@ async def run_approval_check(check: VerifyApprovalCheck) -> Dict[str, Any]:
         "error": error,
     }
 
-_EXPLORER_API_BASE = {
-    "base": "https://api.basescan.org/api",
+_ETHERSCAN_V2_CHAIN_IDS = {
+    "base": 8453,          # Base mainnet
+    "base-sepolia": 84532,  # Base testnet
 }
 
 async def run_contract_verified_check(client: httpx.AsyncClient, check: VerifyContractVerifiedCheck) -> Dict[str, Any]:
+    """
+    Uses Etherscan's unified V2 API, not a separate BaseScan API — BaseScan's
+    standalone API was retired in favor of this single, multi-chain endpoint.
+    One API key (from etherscan.io) now covers Base and dozens of other
+    chains, selected via the `chainid` parameter.
+    """
     t0 = time.time()
     ok = False
     error = None
     verified = None
     status_code = None
 
-    explorer_base = _EXPLORER_API_BASE.get((check.chain or "").lower())
-    basescan_key = os.getenv("BASESCAN_API_KEY", "")
+    chain_id = _ETHERSCAN_V2_CHAIN_IDS.get((check.chain or "").lower())
+    etherscan_key = os.getenv("ETHERSCAN_API_KEY", "")
 
-    if not explorer_base or not basescan_key:
+    if chain_id is None or not etherscan_key:
         latency_ms = int((time.time() - t0) * 1000)
         return {
             "type": "contract_verified",
@@ -1271,18 +1278,19 @@ async def run_contract_verified_check(client: httpx.AsyncClient, check: VerifyCo
             "latency_ms": latency_ms,
             "ok": False,
             "transient": False,
-            "error": "Contract verification not configured for this chain (missing BASESCAN_API_KEY or unsupported chain)",
+            "error": "Contract verification not configured for this chain (missing ETHERSCAN_API_KEY or unsupported chain)",
             "verified": None,
         }
 
     try:
         resp = await client.get(
-            explorer_base,
+            "https://api.etherscan.io/v2/api",
             params={
+                "chainid": chain_id,
                 "module": "contract",
                 "action": "getsourcecode",
                 "address": check.contract_address,
-                "apikey": basescan_key,
+                "apikey": etherscan_key,
             },
             timeout=DEFAULT_TIMEOUT_S,
         )
