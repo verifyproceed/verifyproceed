@@ -247,6 +247,18 @@ class VerifyContractVerifiedCheck(BaseModel):
     chain: str
     contract_address: str
 
+class VerifyApprovalCheck(BaseModel):
+    type: Literal["approval_amount"] = "approval_amount"
+    amount: str
+    spender: Optional[str] = None
+    known_safe_addresses: List[str] = Field(default_factory=list)
+
+
+class VerifyContractVerifiedCheck(BaseModel):
+    type: Literal["contract_verified"] = "contract_verified"
+    chain: str
+    contract_address: str
+
 CheckType = Annotated[
     Union[
         VerifyHTTPCheck,
